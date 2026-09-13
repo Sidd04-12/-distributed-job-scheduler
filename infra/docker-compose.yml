@@ -1,0 +1,96 @@
+name: job-scheduler
+
+# Ports are deliberately offset from the defaults so this stack can run alongside another
+# local Postgres/Redis/Kafka without colliding.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scheduler
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init-db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19093
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19093
+    ports:
+      - "19093:19093"
+      - "9645:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # The API + dispatcher. Only one dispatcher is needed, but running several is safe —
+  # the Redis claim is atomic, which the concurrency tests prove.
+  scheduler-api:
+    build:
+      context: ..
+    environment:
+      SERVER_PORT: 8082
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DISPATCHER_ENABLED: "true"
+      WORKER_ID: api-embedded-worker
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+
+  # Pure worker replicas: no dispatcher, just Kafka consumers. Scale these to add throughput:
+  #   docker compose up -d --scale worker=4
+  # Kafka rebalances partitions across whoever is in the group, with no code change.
+  worker:
+    build:
+      context: ..
+    environment:
+      SERVER_PORT: 8083
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DISPATCHER_ENABLED: "false"
+      WORKER_CONCURRENCY: 2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+
+volumes:
+  pg_data:
